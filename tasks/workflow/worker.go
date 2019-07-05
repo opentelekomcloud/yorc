@@ -585,18 +585,54 @@ func (w *worker) runUndeploy(ctx context.Context, t *taskExecution) error {
 	return nil
 }
 
+func (w *worker) delayPurge(ctx context.Context, t *taskExecution, taskID string) {
+	log.Debugf("let's delay purge as a task is still running:%q", taskID)
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			state, err := tasks.GetTaskStatus(t.cc.KV(), taskID)
+			if err != nil {
+				log.Printf("error occurred during delaying purge:%+v", err)
+				return
+			}
+			if state != tasks.TaskStatusRUNNING {
+				log.Debugf("stop delaying purge as task:%q is no longer running", taskID)
+				return
+			}
+		}
+
+		select {
+		case <-time.After(30 * time.Second):
+			state, err := tasks.GetTaskStatus(t.cc.KV(), taskID)
+			if err != nil {
+				log.Printf("error occurred during delaying purge:%+v", err)
+				return
+			}
+			if state == tasks.TaskStatusRUNNING {
+				log.Debugf("Purge delay timeout is reached: we cancel the task with ID:%q", taskID)
+				tasks.CancelTask(t.cc.KV(), taskID)
+			}
+		}
+	}
+}
+
 func (w *worker) runPurge(ctx context.Context, t *taskExecution) error {
 	kv := w.consulClient.KV()
-	_, err := kv.DeleteTree(path.Join(consulutil.DeploymentKVPrefix, t.targetID), nil)
-	if err != nil {
-		return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
-	}
 	tasksList, err := tasks.GetTasksIdsForTarget(kv, t.targetID)
 	if err != nil {
 		return err
 	}
 	for _, tid := range tasksList {
 		if tid != t.taskID {
+			state, _ := tasks.GetTaskStatus(t.cc.KV(), tid)
+
+			if state == tasks.TaskStatusRUNNING {
+				w.delayPurge(ctx, t, tid)
+			}
 			err = tasks.DeleteTask(kv, tid)
 			if err != nil {
 				return err
@@ -607,6 +643,13 @@ func (w *worker) runPurge(ctx context.Context, t *taskExecution) error {
 			return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
 		}
 	}
+
+	// Delete deployment tree
+	_, err = kv.DeleteTree(path.Join(consulutil.DeploymentKVPrefix, t.targetID), nil)
+	if err != nil {
+		return errors.Wrap(err, consulutil.ConsulGenericErrMsg)
+	}
+
 	// Delete events tree corresponding to the deployment TaskExecution
 	err = events.PurgeDeploymentEvents(kv, t.targetID)
 	if err != nil {
